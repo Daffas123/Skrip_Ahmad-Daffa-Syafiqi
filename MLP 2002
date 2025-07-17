@@ -1,0 +1,315 @@
+!pip install rasterio
+!pip install boruta
+import rasterio as rio
+import rasterio
+import pandas as pd
+import numpy as np
+import sklearn
+import torch
+import torch.nn as nn
+from collections import OrderedDict
+from boruta import BorutaPy
+from torch.optim import Adam, SGD
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+import matplotlib.pyplot as plt
+
+path_csv = "/content/drive/MyDrive/MLP/Sampel/Sampel_2002.csv"
+df = pd.read_csv(path_csv, sep=';')
+ 
+# Cek hasil
+print(df.head())
+print(df.info())
+
+y = df.iloc[:, 0]
+X = df.iloc[:, 1:]
+ 
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+ 
+print(X_train)
+
+rf = RandomForestClassifier()
+ 
+# Boruta fix
+np.int = np.int32
+np.float = np.float64
+np.bool = np.bool_
+ 
+# define Boruta feature selection method
+boruta_selector = BorutaPy(rf, n_estimators='auto', verbose=3, random_state=1, alpha = 0.01)
+ 
+# find all relevant features - 5 features should be selected
+X_train2 = np.array(X_train)
+y_train2 = np.array(y_train)
+ 
+boruta_selector.fit(X_train2, y_train2)
+ 
+print("Ranking: ",boruta_selector.ranking_)
+print("No. of significant features: ", boruta_selector.n_features_)
+
+feature_index = boruta_selector.ranking_
+ 
+selected_variables = X_train.loc[:, feature_index.astype(bool)]
+selected_variables2 = pd.concat([selected_variables, y_train], axis = 1)
+ 
+selected_variables2.to_csv("/content/drive/MyDrive/MLP/Pengolahan/training_2002.csv", index=False)
+ 
+selected_variables = X_test.loc[:, feature_index.astype(bool)]
+selected_variables2 = pd.concat([selected_variables, y_test], axis = 1)
+ 
+selected_variables2.to_csv("/content/drive/MyDrive/MLP/Pengolahan/testing_2002.csv", index=False)
+
+DEVICE = "cpu"
+print("[INFO] training using {} ...".format(DEVICE))
+
+data_train = "/content/drive/MyDrive/MLP/Pengolahan/training_2002.csv"
+df_train = pd.read_csv(data_train)
+ 
+data_test = "/content/drive/MyDrive/MLP/Pengolahan/testing_2002.csv"
+df_test = pd.read_csv(data_test)
+
+X_train = df_train.iloc[:, 0:10]
+y_train = df_train.iloc[:, 10]
+ 
+X_test = df_test.iloc[:, 0:10]
+y_test = df_test.iloc[:, 10]
+ 
+# convert to array
+X_train2 = X_train.to_numpy()
+X_test2 = X_test.to_numpy()
+y_train2 = y_train.to_numpy()
+y_test2 = y_test.to_numpy()
+ 
+# change category to begin from 0
+y_train2 = y_train2 - 1
+y_test2 = y_test2 - 1
+ 
+X_train2.shape, X_test2.shape, y_train2.shape, y_test2.shape
+
+trainX = torch.from_numpy(X_train2).float()
+testX = torch.from_numpy(X_test2).float()
+trainY = torch.from_numpy(y_train2).float()
+testY = torch.from_numpy(y_test2).float()
+
+#load model
+class mlp(nn.Module):
+    def __init__(self, inputvector=10, neuron1=64, neuron2=32, outputclass=11):
+        super(mlp, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(inputvector, neuron1),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(neuron1, neuron2),
+            nn.ReLU(),
+            nn.Linear(neuron2, outputclass)
+        )
+ 
+    def forward(self, x):
+        return self.mlp(x)
+ 
+mlp2 = mlp()
+mlp2 = mlp2.to(DEVICE)
+print(mlp2)
+
+BATCH_SIZE =512
+EPOCH = 1000
+LR = 1e-4
+ 
+opt = Adam(mlp2.parameters(), lr=1e-2)
+lossFunc = torch.nn.CrossEntropyLoss()
+
+scaler = StandardScaler()
+X_train2 = scaler.fit_transform(X_train2)
+X_test2 = scaler.transform(X_test2)
+ 
+weights = compute_class_weight('balanced', classes=np.unique(y_train2), y=y_train2)
+weights = torch.tensor(weights, dtype=torch.float32)
+lossFunc = torch.nn.CrossEntropyLoss(weight=weights)
+
+def next_batch(inputs, targets, batchSize):
+    #loop over the dataset
+    for i in range(0, inputs.shape[0], batchSize):
+        #yield a tuple of the current batched data and label
+        yield (inputs[i:i + batchSize], targets[i:i +batchSize])
+
+loss_train_hist = []
+loss_test_hist = []
+accuracy_train_hist = []
+accuracy_test_hist = []
+ 
+#loop through the epochs
+for epoch in range(0, EPOCH):
+  print("[INFO] epoch: {}...".format(epoch + 1))
+  trainLoss = 0
+  trainAcc = 0
+  samples = 0
+  mlp2.train()
+ 
+    # loop over the current batch of data
+  for (batchX, batchY) in next_batch(trainX, trainY, BATCH_SIZE):
+    (batchX, batchY) = (batchX.to(DEVICE), batchY.to(DEVICE))
+    predictions = mlp2(batchX)
+    loss = lossFunc(predictions, batchY.long())
+ 
+        # zeroing gradient
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+ 
+        # update training loss, accuracy
+    trainLoss += loss.item() * batchY.size(0)
+    trainAcc += (predictions.max(1)[1] == batchY).sum().item()
+    samples += batchY.size(0)
+    loss_train_hist.append(trainLoss / samples)
+    accuracy_train_hist.append(trainAcc / samples)
+ 
+    # display model progress on the current training batch
+  trainTemplate = "epoch: {} train loss: {:.3f} train accuracy: {:.3f}"
+  print(trainTemplate.format(epoch + 1, (trainLoss / samples),
+    (trainAcc / samples)))
+ 
+  # evaluation
+  testLoss = 0
+  testAcc = 0
+  samples = 0
+  mlp2.eval()
+ 
+  with torch.no_grad():
+    # loop over the current batch of test data
+    for (batchX, batchY) in next_batch(testX, testY, BATCH_SIZE):
+      (batchX, batchY) = (batchX.to(DEVICE), batchY.to(DEVICE))
+      # calculate loss
+      predictions = mlp2(batchX)
+      loss = lossFunc(predictions, batchY.long())
+      # update test loss, accuracy
+      testLoss += loss.item() * batchY.size(0)
+      testAcc += (predictions.max(1)[1] == batchY).sum().item()
+      samples += batchY.size(0)
+ 
+      loss_test_hist.append(testLoss / samples)
+      accuracy_test_hist.append(testAcc / samples)
+    # display model progress on the current test batch
+    testTemplate = "epoch: {} test loss: {:.3f} test accuracy: {:.3f}"
+    print(testTemplate.format(epoch + 1, (testLoss / samples),
+      (testAcc / samples)))
+    print("")
+
+print("BatchX shape:", batchX.shape)
+print("Model structure:", mlp2)
+
+plt.plot(loss_train_hist, label="train")
+plt.plot(loss_test_hist, label="test")
+plt.xlabel("epochs")
+plt.ylabel("cross entropy")
+plt.legend()
+plt.show()
+ 
+plt.plot(accuracy_train_hist, label="train")
+plt.plot(accuracy_test_hist, label="test")
+plt.xlabel("epochs")
+plt.ylabel("accuracy")
+plt.legend()
+plt.show()
+
+# prediction to the test data
+predictions = []
+ 
+with torch.no_grad():
+    for (batchX, batchY) in next_batch(testX, testY, BATCH_SIZE):
+        (batchX, batchY) = (batchX.to(DEVICE), batchY.to(DEVICE))
+        outputs = mlp2(batchX)
+        _, predicted = torch.max(outputs, 1)
+        predictions.extend(predicted.cpu().numpy())
+ 
+# Optionally, convert predictions list to tensor
+predictions = torch.tensor(predictions)
+ 
+print("Predictions:", predictions)
+
+testY = torch.tensor(testY)
+testY = testY.to(predictions.device)
+ 
+correct = (predictions == testY).sum().item()
+total = testY.size(0)
+ 
+accuracy = correct / total
+ 
+print(f'Accuracy: {accuracy * 100:.2f}%')
+
+torch.save(mlp2, '/content/nn_model_boruta.pth')
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("[INFO] training using {} ...".format(DEVICE))
+
+# Harus setelah definisi class mlp seperti di atas
+model_path = "/content/nn_model_boruta.pth"
+nn_model = torch.load(model_path, weights_only=False)
+nn_model.eval()
+
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.preprocessing import LabelEncoder
+ 
+print(f"Jumlah sampel data testing: {len(X_test)}")
+ 
+X_test_tensor = torch.tensor(X_test.values).float()
+ 
+nn_model.eval()
+with torch.no_grad():
+    test_output = nn_model(X_test_tensor)
+    _, test_predicted = torch.max(test_output, 1)
+ 
+if not np.issubdtype(y_test.dtype, np.integer):
+    le = LabelEncoder()
+    y_test_encoded = le.fit_transform(y_test)
+else:
+    y_test_encoded = y_test.values
+ 
+cm = confusion_matrix(y_test_encoded, test_predicted.numpy())
+print("Confusion Matrix:\n", cm)
+ 
+print("\nClassification Report:\n", classification_report(y_test_encoded, test_predicted.numpy()))
+
+# jumlah kolom +1
+matching_index = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+ 
+array_index = np.array(matching_index)
+array_list = array_index.tolist()
+ 
+# open raster
+ 
+with rasterio.open("/content/drive/MyDrive/MLP/Citra_2002.tif") as rst:
+    meta = rst.meta
+    raster = rst.read(array_list)
+ 
+flat_data = raster.transpose(1, 2, 0).reshape(-1, raster.shape[0])
+ 
+# Also store height and width for reshaping later
+height = rst.height
+width = rst.width
+
+# convert to tensor
+flat_data_tensor = torch.tensor(flat_data).float()
+
+# Perform inference
+with torch.no_grad():
+    output = nn_model(flat_data_tensor)
+ 
+_, predicted = torch.max(output, 1)
+ 
+print(predicted)
+
+# change prediction to raster
+predictions_reshaped = predicted.cpu().reshape(height, width)
+ 
+import matplotlib.pyplot as plt
+plt.figure(figsize=(10, 8))
+plt.imshow(predictions_reshaped, cmap='viridis', interpolation='none')
+plt.colorbar(label='Prediction Values')
+
+# save map
+meta.update({'count': 1, "dtype": 'float32'})
+ 
+with rasterio.open("/content/drive/MyDrive/MLP/Hasil/KlasifikasiMLP_2002.tif", 'w', **meta) as classified:
+    classified.write(predictions_reshaped, 1)

@@ -1,0 +1,146 @@
+!pip install rasterio
+!pip install geopandas
+import rasterio
+import numpy as np
+import geopandas as gpd
+from rasterio.mask import mask
+from rasterio import Affine
+from rasterio.enums import Resampling
+from shapely.geometry import mapping
+from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import GaussianNB
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, confusion_matrix
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
+sr_path = '/content/drive/MyDrive/Exports 2002 kemarau/Komposit_Median_2002.tif'
+ 
+with rasterio.open(sr_path) as src:
+    sr_stack = src.read()
+    profile = src.profile
+    transform = src.transform
+ 
+sr_stack = np.transpose(sr_stack, (1, 2, 0))
+print(f'Shape SR stack: {sr_stack.shape}')
+
+# Load kelas
+gdf = gpd.read_file('/content/drive/MyDrive/Exports 2002/Kelas_2002.geojson')
+gdf = gdf.to_crs(profile['crs'])
+ 
+values, labels = [], []
+ 
+for idx, row in gdf.iterrows():
+    geom = [mapping(row['geometry'])]
+    try:
+        with rasterio.open(sr_path) as src:
+            out_image, out_transform = mask(dataset=src, shapes=geom, crop=True, filled=False)
+ 
+        out_image = np.transpose(out_image, (1, 2, 0))
+ 
+        # Indeks
+        B1, B2, B3, B4, B5, B6, B7 = [out_image[:, :, i].astype('float32') for i in range(7)]
+        ndvi = (B5 - B4) / (B5 + B4)
+        mndwi = (B3 - B6) / (B3 + B6)
+        ndbi = (B6 - B5) / (B6 + B5)
+ 
+        for arr in [ndvi, mndwi, ndbi]:
+            arr[np.isinf(arr)] = np.nan
+ 
+        patch_stack = np.dstack((out_image, ndvi, mndwi, ndbi))
+        patch_stack = patch_stack.reshape(-1, patch_stack.shape[-1])
+        patch_stack = patch_stack[~np.isnan(patch_stack).any(axis=1)]
+ 
+        values.extend(patch_stack)
+        labels.extend([row['Kelas']] * patch_stack.shape[0])
+ 
+    except Exception as e:
+        print(f"Polygon {idx} dilewati karena error: {e}")
+        continue
+
+# Pembuatan training testing
+X = np.array(values)
+y = np.array(labels)
+print(f'Data yang digunakan untuk pelatihan: {X.shape}')
+ 
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+# Klasifikasi Naive Bayes
+clf = GaussianNB()
+clf.fit(X_train, y_train)
+
+# Confussion matrix
+y_pred = clf.predict(X_test)
+print("Akurasi data uji:", accuracy_score(y_test, y_pred))
+print("Confusion Matrix (data uji):\n", confusion_matrix(y_test, y_pred))
+
+# Prediksi dan visualisasi
+nrow, ncol, n_bands_original = sr_stack.shape
+ 
+if n_bands_original < 7:
+    raise ValueError(f"Expected at least 7 bands in sr_stack but found {n_bands_original}")
+ 
+B1_full, B2_full, B3_full, B4_full, B5_full, B6_full, B7_full = [sr_stack[:, :, i].astype('float32') for i in range(7)]
+ 
+ndvi_full = (B5_full - B4_full) / (B5_full + B4_full)
+mndwi_full = (B3_full - B6_full) / (B3_full + B6_full)
+ndbi_full = (B6_full - B5_full) / (B6_full + B5_full)
+ 
+for arr in [ndvi_full, mndwi_full, ndbi_full]:
+    arr[np.isinf(arr)] = np.nan
+ 
+ndvi_full_reshaped = ndvi_full[:, :, np.newaxis]
+mndwi_full_reshaped = mndwi_full[:, :, np.newaxis]
+ndbi_full_reshaped = ndbi_full[:, :, np.newaxis]
+ 
+sr_stack_features = np.dstack((sr_stack, ndvi_full_reshaped, mndwi_full_reshaped, ndbi_full_reshaped))
+ 
+sr_flat_features = sr_stack_features.reshape(-1, sr_stack_features.shape[-1])
+ 
+imputer = SimpleImputer(strategy='mean')
+sr_flat_imputed = imputer.fit_transform(sr_flat_features)
+ 
+classified_flat = clf.predict(sr_flat_imputed)
+ 
+classified_image = classified_flat.reshape(nrow, ncol)
+ 
+unique_classes_train = np.unique(y)
+num_classes = len(unique_classes_train)
+ 
+colors = plt.cm.get_cmap('tab20', num_classes)
+ 
+class_to_idx = {cls: i for i, cls in enumerate(unique_classes_train)}
+ 
+classified_image_indexed = np.vectorize(class_to_idx.get)(classified_image)
+ 
+ 
+plt.figure(figsize=(10, 8))
+plt.imshow(classified_image_indexed, cmap=colors, interpolation='nearest')
+ 
+cbar = plt.colorbar(ticks=range(num_classes))
+ 
+cbar.set_ticklabels([str(int(cls)) for cls in unique_classes_train])
+cbar.set_label('Kelas')
+ 
+plt.title('Naive Bayes 2002')
+plt.axis('off')
+plt.tight_layout()
+plt.show()
+
+# Ekspor hasil klasifikasi
+with rasterio.open(sr_path) as src:
+    profile = src.profile
+ 
+profile.update(
+    dtype=rasterio.uint8,
+    count=1,
+    compress='lzw',
+    height=classified_image.shape[0],
+    width=classified_image.shape[1]
+)
+ 
+output_filepath = "/content/drive/MyDrive/Exports 2002 kemarau/Klasifikasi_NaiveBayes_2002.tif" # Specify file name
+with rasterio.open(output_filepath, "w", **profile) as dst:
+    dst.write(classified_image.astype(rasterio.uint8), 1)
+ 
+print(f"Hasil klasifikasi berhasil diekspor sebagai GeoTIFF: {output_filepath}")
